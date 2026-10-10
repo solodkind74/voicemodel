@@ -32,10 +32,32 @@ def probs(model, a):
     return model(torch.from_numpy(a.astype(np.float32))[None].to(dev)).softmax(-1)[0].cpu()
 
 
-def stream(model, thresh, hop=0.25):
-    buf = np.zeros(CLIP, np.float32)
-    hist = collections.deque(maxlen=3)  # smooth over 3 consecutive windows
-    last = 0.0
+class Detector:
+    """Streaming logic shared by the live mic and simulate.py: a 1 s window slides every `hop` s;
+    a word fires when its probability, averaged over the last `smooth` windows, exceeds `thresh`."""
+
+    def __init__(self, model, thresh=0.8, hop=0.1, smooth=3, cooldown=1.0):
+        self.model, self.thresh, self.hop, self.cooldown = model, thresh, hop, cooldown
+        self.buf = np.zeros(CLIP, np.float32)
+        self.hist = collections.deque(maxlen=smooth)
+        self.t = 0.0  # stream time in seconds (sample-accurate, so simulations are deterministic)
+        self.last = -1e9
+
+    def feed(self, blk):
+        """blk: float32 audio of length hop*SR. Returns (label, prob) or None."""
+        self.buf = np.concatenate([self.buf[len(blk):], blk])
+        self.t += len(blk) / SR
+        self.hist.append(probs(self.model, self.buf))
+        p = torch.stack(list(self.hist)).mean(0)
+        k = int(p.argmax())
+        if LABELS[k][0] != "_" and p[k] > self.thresh and self.t - self.last > self.cooldown:
+            self.last = self.t
+            return LABELS[k], float(p[k])
+        return None
+
+
+def stream(model, thresh, hop, smooth):
+    det = Detector(model, thresh, hop, smooth)
     q = collections.deque()
     print("listening… say: " + ", ".join(LABELS[:-2]) + "  (ctrl-c to quit)")
     with sd.InputStream(samplerate=SR, channels=1, blocksize=int(SR * hop),
@@ -43,14 +65,9 @@ def stream(model, thresh, hop=0.25):
         while True:
             while not q:
                 time.sleep(0.01)
-            blk = q.popleft()
-            buf = np.concatenate([buf[len(blk):], blk])
-            hist.append(probs(model, buf))
-            p = torch.stack(list(hist)).mean(0)
-            k = int(p.argmax())
-            if LABELS[k][0] != "_" and p[k] > thresh and time.time() - last > 1.0:
-                last = time.time()
-                print(f"  >> {LABELS[k]:<8} {p[k]:.2f}")
+            hit = det.feed(q.popleft())
+            if hit:
+                print(f"  >> {hit[0]:<8} {hit[1]:.2f}")
 
 
 def classify(model, a_int16):
@@ -87,9 +104,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="runs/hubert")
     ap.add_argument("--thresh", type=float, default=0.8)
+    ap.add_argument("--hop", type=float, default=0.1, help="seconds between windows")
+    ap.add_argument("--smooth", type=int, default=3, help="windows averaged before deciding")
     ap.add_argument("--test", metavar="WORD")
     ap.add_argument("-n", type=int, default=10)
     ap.add_argument("--score", action="store_true")
     a = ap.parse_args()
     m = load(a.run)
-    score(m) if a.score else test(m, a.test, a.n) if a.test else stream(m, a.thresh)
+    score(m) if a.score else test(m, a.test, a.n) if a.test else stream(m, a.thresh, a.hop, a.smooth)

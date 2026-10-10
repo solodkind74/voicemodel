@@ -128,12 +128,27 @@ def reverb(x):
     return y * (x.abs().amax(1, keepdim=True) / y.abs().amax(1, keepdim=True).clamp_min(1e-6))
 
 
+def shift(x, s):
+    """Shift each row by s samples (B, 1), zero-filling."""
+    pos = torch.arange(CLIP, device=x.device)[None] - s
+    return torch.where((pos >= 0) & (pos < CLIP), x.gather(1, pos.clamp(0, CLIP - 1)), 0.0)
+
+
+def add_context(x, p=0.7):
+    """Streaming realism: paste the edge of another clip's word into the window, as when words are
+    spoken back to back. A partner shifted by 0.55-0.85 s leaves only its first/last 50-350 ms visible."""
+    B, dev = len(x), x.device
+    partner = x[torch.randperm(B, device=dev)]
+    mag = torch.randint(int(0.55 * CLIP), int(0.85 * CLIP), (B, 1), device=dev)
+    sign = torch.where(torch.rand(B, 1, device=dev) < 0.5, -1, 1)
+    frag = shift(partner, mag * sign) * torch.empty(B, 1, device=dev).uniform_(0.3, 1.0)
+    return x + frag * (torch.rand(B, 1, device=dev) < p)
+
+
 def augment(x, noise, is_synth):
     B, dev = len(x), x.device
     # random time shift +-150 ms
-    shift = torch.randint(-2400, 2401, (B, 1), device=dev)
-    pos = torch.arange(CLIP, device=dev)[None] - shift
-    x = torch.where((pos >= 0) & (pos < CLIP), x.gather(1, pos.clamp(0, CLIP - 1)), 0.0)
+    x = shift(x, torch.randint(-2400, 2401, (B, 1), device=dev))
     # TTS audio is studio-clean: randomly muffle it (lowpass) to look more like a laptop mic
     # (FFT-domain soft rolloff; a biquad's sample-by-sample loop is very slow on GPU)
     if is_synth.any():

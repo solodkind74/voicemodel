@@ -21,6 +21,7 @@ uv run python train_hubert.py              # frozen HuBERT + head, ~12 min (most
 uv run python listen.py                    # live mic (runs/hubert)
 uv run python listen.py --test jarvis -n 15   # record + score YOUR voice -> data/mine/ (eval only)
 uv run python listen.py --score --run runs/v2  # re-score saved clips with any model
+uv run python simulate.py --gap 0.4 0.8 --grid # replay recordings as a live stream, tune detector settings
 ```
 
 Splits are by speaker: Speech Commands' official lists; for TTS whole voices are held out (12 mac, 100 Piper).
@@ -54,7 +55,26 @@ layers 7–9 most, the "phonetic" middle of the network.
 
 Caveat: "my voice" is one speaker and 20 clips. It's a sanity check, not a benchmark.
 
+### Lesson 3: the deployed pipeline is part of the model
+In `--test` mode jarvis scored 20/20, but in live streaming it fired only ~50% of the time. `simulate.py` replays
+recordings through the *exact* live `Detector`, with realistic 0.4–0.8 s gaps between words, and reproduced it:
+15/30. Cause: "jarvis" (~0.6 s) is long, so a 1 s window sliding every 250 ms fully contains it in only one or two
+positions, and averaging 3 windows (0.5 s) diluted it. Short commands fit in many windows, so they were fine.
+
+| detector (30 jarvis, 60 real commands, 30 real unknown words; gaps 0.4–0.8 s) | jarvis | commands | false triggers |
+|---|---|---|---|
+| hop 250 ms, avg 3, thresh 0.8 (old) | 15/30 | 41/60 | 2/30 |
+| **hop 100 ms, avg 3, thresh 0.8 (new default)** | **27/30** | **53/60** | 3/30 |
+| hop 100 ms, avg 1, thresh 0.6 | 30/30 | 51/60 | 10/30 |
+
+Tried and rejected: **context augmentation** (`train_hubert.py --context`, pastes neighbor-word fragments into
+training windows). It made streaming jarvis *worse* (9/30 vs 15/30 at hop 250 ms) and dropped my clips to 27/30.
+Likely cause: fragments of "jarvis" land inside windows labeled as other words, which teaches the model that
+partial jarvis = not jarvis.
+
 ## Ideas to try next
+- **Streaming-native model:** keep HuBERT frame features (don't average over 1 s) + a small temporal model, so a
+  long word doesn't need to fit one window. Or train with windows of 1.5 s.
 - **Record negatives too** (`--test stop`, `--test _unknown_` saying random words) to measure false accepts on your voice.
 - **Fine-tune the top HuBERT layers** instead of freezing everything, or try `WAVLM_BASE_PLUS` / `WAV2VEC2_BASE`.
 - **Smaller deployable model:** distill HuBERT+head into the 0.57M CNN (teacher labels on real speech).
