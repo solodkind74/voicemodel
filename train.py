@@ -16,13 +16,17 @@ import torch.nn.functional as F
 import torchaudio.transforms as T
 
 from common import (CLIP, COMMANDS, L2I, LABELS, SC_DIR, SYN_DIR, KWSNet, device, fit_1s,
-                    load_wav)
+                    load_wav, trim_silence)
 
-CACHE = SC_DIR.parent / "cache.npz"
+CACHE = SC_DIR.parent / "cache_{}.npz"
 
 
 # ---------------------------------------------------------------- data
-def build_index(seed=0):
+SYNTH = {"mac": (SYN_DIR, 8), "piper": (SYN_DIR.parent / "synth_piper", 60)}
+MINE = SC_DIR.parent / "mine"
+
+
+def build_index(synth=("mac", "piper"), seed=0):
     """Returns list of (path, label, split, source)."""
     rng = random.Random(seed)
     val = set((SC_DIR / "validation_list.txt").read_text().split())
@@ -46,27 +50,40 @@ def build_index(seed=0):
     items = [i for i in items if i[1] != "_unknown_" or i in keep]
 
     # synthetic: split by *voice* so val/test speakers are never seen in training
-    vj = json.loads((SYN_DIR / "voices.json").read_text())
-    tag = lambda v: v.replace(" ", "_").replace("(", "").replace(")", "")
-    test_v = {tag(v) for v in vj["test"]}
-    train_v = sorted(tag(v) for v in vj["all"] if tag(v) not in test_v)
-    val_v = set(random.Random(seed + 1).sample(train_v, 8))
-    for kind, label in (("pos", "jarvis"), ("neg", "_unknown_")):
-        for f in sorted((SYN_DIR / kind).glob("*.wav")):
-            v = f.name.split("__")[0]
-            split = "test" if v in test_v else "val" if v in val_v else "train"
-            items.append((str(f), label, split, "synth"))
+    for src in synth:
+        root, n_val = SYNTH[src]
+        vj = json.loads((root / "voices.json").read_text())
+        tag = lambda v: v.replace(" ", "_").replace("(", "").replace(")", "")
+        test_v = {tag(v) for v in vj["test"]}
+        train_v = sorted(tag(v) for v in vj["all"] if tag(v) not in test_v)
+        val_v = set(random.Random(seed + 1).sample(train_v, n_val))
+        for kind in ("pos", "neg", "cmd"):
+            for f in sorted((root / kind).glob("*.wav")):
+                v, word = f.name.split("__")[:2]
+                label = {"pos": "jarvis", "neg": "_unknown_", "cmd": word}[kind]
+                split = "test" if v in test_v else "val" if v in val_v else "train"
+                items.append((str(f), label, split, src))
     return items
 
 
-def load_all(items):
-    if CACHE.exists():
-        z = np.load(CACHE, allow_pickle=True)
+def load_mine():
+    """Your own recordings from `listen.py --test WORD` (data/mine/<word>/*.wav): the real-world check."""
+    fs = sorted(MINE.glob("*/*.wav"))
+    if not fs:
+        return None
+    x = torch.from_numpy(np.stack([fit_1s(trim_silence(load_wav(f))) for f in fs]).astype(np.float32) / 32768)
+    return x, torch.tensor([L2I[f.parent.name] for f in fs]), [f.parent.name for f in fs]
+
+
+def load_all(items, synth):
+    cache = Path(str(CACHE).format("_".join(synth)))
+    if cache.exists():
+        z = np.load(cache, allow_pickle=True)
         if list(z["paths"]) == [i[0] for i in items]:
             return z["audio"]
     with ThreadPoolExecutor(8) as ex:
         audio = np.stack(list(ex.map(lambda i: fit_1s(load_wav(i[0])), items)))
-    np.savez(CACHE, paths=np.array([i[0] for i in items]), audio=audio)
+    np.savez(cache, paths=np.array([i[0] for i in items]), audio=audio)
     return audio
 
 
@@ -98,6 +115,19 @@ def make_split(items, audio, split, noise, n_silence, seed):
 
 
 # ---------------------------------------------------------------- augmentation (on GPU)
+def reverb(x):
+    B, dev = len(x), x.device
+    L = 6400  # 0.4 s tail
+    t = torch.arange(L, device=dev) / 16000
+    rt60 = torch.empty(B, 1, device=dev).uniform_(0.15, 0.8)
+    tail = torch.randn(B, L, device=dev) * torch.exp(-6.9 * t / rt60)
+    h = tail / tail.norm(dim=1, keepdim=True) * torch.empty(B, 1, device=dev).uniform_(0.3, 1.5)
+    h[:, 0] = 1.0
+    n = CLIP + L
+    y = torch.fft.irfft(torch.fft.rfft(x, n) * torch.fft.rfft(h, n), n)[:, :CLIP]
+    return y * (x.abs().amax(1, keepdim=True) / y.abs().amax(1, keepdim=True).clamp_min(1e-6))
+
+
 def augment(x, noise, is_synth):
     B, dev = len(x), x.device
     # random time shift +-150 ms
@@ -112,6 +142,8 @@ def augment(x, noise, is_synth):
         cut = torch.empty(B, 1, device=dev).uniform_(2500, 7000)
         mask = torch.where(is_synth[:, None], 1 / (1 + (f / cut) ** 4), 1.0)
         x = torch.fft.irfft(X * mask, n=CLIP)
+    # room reverb on 50%: random synthetic impulse response (direct path + decaying noise tail)
+    x = torch.where(torch.rand(B, 1, device=dev) < 0.5, reverb(x), x)
     # background noise at random SNR (0-25 dB) for 80% of samples
     n = noise_crops(noise, B).to(dev)
     sp = x.pow(2).mean(1, keepdim=True).clamp_min(1e-8)
@@ -140,11 +172,13 @@ def report(probs, y, src):
         m = y == L2I[l]
         out[f"acc/{l}"] = (pred[m] == y[m]).float().mean().item()
     W = L2I["jarvis"]
-    syn_neg = torch.from_numpy(src == "synth") & (y != W)
-    real_non = torch.from_numpy(src != "synth") & (y != W)
-    out["jarvis_recall"] = out["acc/jarvis"]
+    real_non = torch.from_numpy(np.isin(src, ["real", "noise"])) & (y != W)
     out["jarvis_false_accept/real"] = (pred[real_non] == W).float().mean().item()
-    out["jarvis_false_accept/tts_neg"] = (pred[syn_neg] == W).float().mean().item()
+    for s in ("mac", "piper"):
+        m = torch.from_numpy(src == s)
+        if m.any():
+            out[f"jarvis_recall/{s}"] = (pred[m & (y == W)] == W).float().mean().item()
+            out[f"jarvis_false_accept/{s}"] = (pred[m & (y != W)] == W).float().mean().item()
     return out
 
 
@@ -155,23 +189,25 @@ def main():
     ap.add_argument("--bs", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--no-hard-neg", action="store_true", help="drop TTS negatives from train")
+    ap.add_argument("--synth", default="mac,piper", help="synthetic sources: mac,piper")
     ap.add_argument("--out", default="runs/main")
     args = ap.parse_args()
     torch.manual_seed(0); np.random.seed(0)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
-    items = build_index()
-    audio = load_all(items)
+    synth = tuple(args.synth.split(","))
+    items = build_index(synth)
+    audio = load_all(items, synth)
     noise_tr, noise_ev = load_noise()
     xtr, ytr, str_ = make_split(items, audio, "train", noise_tr, 3000, 1)
     xva, yva, sva = make_split(items, audio, "val", noise_ev, 400, 2)
     keep = torch.ones(len(ytr), dtype=torch.bool)
     if args.no_hard_neg:
-        keep = ~((torch.tensor([s == "synth" for s in str_])) & (ytr == L2I["_unknown_"]))
+        keep = ~((torch.tensor([s in SYNTH for s in str_])) & (ytr == L2I["_unknown_"]))
     xtr, ytr = xtr[keep], ytr[keep]
     str_ = [s for s, k in zip(str_, keep) if k]
-    synth_tr = torch.tensor([s == "synth" for s in str_])
+    synth_tr = torch.tensor([s in SYNTH for s in str_])
     print(f"loaded in {time.time() - t0:.0f}s | train {len(ytr)} val {len(yva)}")
     print("train counts:", {l: int((ytr == i).sum()) for i, l in enumerate(LABELS)})
 
@@ -203,9 +239,9 @@ def main():
             opt.zero_grad(); loss.backward(); opt.step(); sched.step()
             tot += loss.item()
         r = report(predict(model, xva), yva, sva)
-        print(f"ep {ep + 1:2d} loss {tot / steps:.3f} | val acc {r['acc']:.3f} "
-              f"jarvis rec {r['jarvis_recall']:.3f} FA real {r['jarvis_false_accept/real']:.4f} "
-              f"FA tts {r['jarvis_false_accept/tts_neg']:.3f} | {time.time() - t:.0f}s")
+        print(f"ep {ep + 1:2d} loss {tot / steps:.3f} | val acc {r['acc']:.3f} jarvis " + " ".join(
+            f"{k.split('_')[-1]} {v:.3f}" for k, v in r.items() if k.startswith("jarvis"))
+            + f" | {time.time() - t:.0f}s")
         if r["acc"] > best:
             best = r["acc"]
             torch.save(model.state_dict(), out / "model.pt")
@@ -213,6 +249,12 @@ def main():
     model.load_state_dict(torch.load(out / "model.pt"))
     xte, yte, ste = make_split(items, audio, "test", noise_ev, 400, 3)
     r = report(predict(model, xte), yte, ste)
+    mine = load_mine()
+    if mine:
+        p = predict(model, mine[0]).argmax(-1)
+        for w in sorted(set(mine[2])):
+            m = torch.tensor([v == w for v in mine[2]])
+            r[f"mine/{w}"] = (p[m] == mine[1][m]).float().mean().item()
     (out / "metrics.json").write_text(json.dumps(r, indent=1))
     print("TEST:", json.dumps({k: round(v, 4) for k, v in r.items()}, indent=1))
 
