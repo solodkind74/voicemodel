@@ -1,0 +1,16 @@
+[project]
+name = "voicemodel"
+version = "0.1.0"
+description = "Train a spoken-command / wake-word classifier on Speech Commands + synthetic TTS data"
+authors = [
+    { name = "solodkind74", email = "solodkind@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.3",
+    "sounddevice>=0.5.6",
+    "soundfile>=0.14.0",
+    "torch>=2.14.1",
+    "torchaudio>=2.11.0",
+    "tqdm>=4.70.1",
+]
